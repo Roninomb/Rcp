@@ -1,4 +1,4 @@
-const int botonPin = 15;  // Pin del botón
+const int botonPin = 34;  // Pin del botón
 
 
 int estadoBotonActual = HIGH;
@@ -20,8 +20,8 @@ int contador = 0;
 
 void setup() {
   pinMode(botonPin, INPUT_PULLUP);
-  Serial.begin(115200);  // velocidad más común en ESP32
-  Serial.println("Presioná el botón con ritmo de 100 a 120 bpm (cada 500 a 600 ms).");
+  Serial.begin(115200);
+
 }
 
 
