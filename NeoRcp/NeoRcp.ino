@@ -3,7 +3,7 @@ const int sensorPin = 34;
 
 int estadoBotonActual = HIGH;
 int estadoBotonAnterior = HIGH;
-
+float PrimeraCompresion = 1;
 unsigned long tiempoAnterior = 0;
 unsigned long ultimoCambio = 0;
 
@@ -59,8 +59,8 @@ void loop() {
     entrenamientoFinalizado = true;
 
     Serial.println("⏹️ Tiempo finalizado.");
-
-    float porcentajeRitmo = (compresionesTotales > 0) ? (ritmoCorrecto * 100.0 / compresionesTotales) : 0;
+    float compresionesTotales2 = compresionesTotales - PrimeraCompresion;
+    float porcentajeRitmo = (compresionesTotales > 0) ? (ritmoCorrecto * 100.0 / compresionesTotales2) : 0;
     float porcentajeFuerza = (compresionesTotales > 0) ? (fuerzaCorrecta * 100.0 / compresionesTotales) : 0;
     float porcentajeGeneral = (porcentajeRitmo + porcentajeFuerza) / 2.0;
 
