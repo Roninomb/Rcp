@@ -1,0 +1,10 @@
+Desde APP a ESP
+bool "comenzarEntrenamiento"
+Desde ESP a APP
+durante el entrenamiento(boton apretado) = 
+bool "fuerza"
+string "ritmo"
+Finalizado el entrenamiento
+string datos del reporte (fuerza correcta, ritmo correcto, efectividad)
+
+
