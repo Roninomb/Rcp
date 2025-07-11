@@ -1,5 +1,6 @@
-const int botonPin = 35;
-const int sensorPin = 34;
+const int botonPin = 33;
+const int sensorPin1 = 34; // Sensor de fuerza débil
+const int sensorPin2 = 35; // Sensor de fuerza fuerte
 
 int estadoBotonActual = HIGH;
 int estadoBotonAnterior = HIGH;
@@ -19,16 +20,16 @@ unsigned long tiempoInicio = 0;
 bool entrenamientoIniciado = false;
 bool entrenamientoFinalizado = false;
 
-// Banderas internas
 bool presionado = false;
-bool fuerzaDetectada = false;
-bool fuerzaLiberada = false;
+bool sensor1Detectado = false;
+bool sensor2Detectado = false;
 
 void setup() {
   pinMode(botonPin, INPUT_PULLUP);
-  pinMode(sensorPin, INPUT);
+  pinMode(sensorPin1, INPUT);
+  pinMode(sensorPin2, INPUT);
   Serial.begin(115200);
-  Serial.println("📢 Escribí 'ya' en el Monitor Serie para comenzar el entrenamiento de 30 segundos.");
+  Serial.println("📢 Escribí 'ya' en el Monitor Serie para comenzar el entrenamiento de 20 segundos.");
 }
 
 void loop() {
@@ -46,8 +47,8 @@ void loop() {
         ultimoCambio = 0;
         tiempoInicio = millis();
         presionado = false;
-        fuerzaDetectada = false;
-        fuerzaLiberada = false;
+        sensor1Detectado = false;
+        sensor2Detectado = false;
         Serial.println("🔁 Nuevo entrenamiento iniciado: tenés 20 segundos para hacer compresiones.");
       }
     }
@@ -64,72 +65,48 @@ void loop() {
     float porcentajeFuerza = (compresionesTotales > 0) ? (fuerzaCorrecta * 100.0 / compresionesTotales) : 0;
     float porcentajeGeneral = (porcentajeRitmo + porcentajeFuerza) / 2.0;
 
-    Serial.print("🧮 Total de compresiones: ");
-    Serial.println(compresionesTotales);
-
-    Serial.print("🎯 Ritmo correcto: ");
-    Serial.print(ritmoCorrecto);
-    Serial.print(" (");
-    Serial.print(porcentajeRitmo, 1);
-    Serial.println("%)");
-
-    Serial.print("💪 Fuerza correcta: ");
-    Serial.print(fuerzaCorrecta);
-    Serial.print(" (");
-    Serial.print(porcentajeFuerza, 1);
-    Serial.println("%)");
-
-    Serial.print("📊 Evaluación general: ");
-    Serial.print(porcentajeGeneral, 1);
-    Serial.println("% de efectividad");
-
+    Serial.print("🧮 Total de compresiones: "); Serial.println(compresionesTotales);
+    Serial.print("🎯 Ritmo correcto: "); Serial.print(ritmoCorrecto); Serial.print(" ("); Serial.print(porcentajeRitmo, 1); Serial.println("%)");
+    Serial.print("💪 Fuerza correcta: "); Serial.print(fuerzaCorrecta); Serial.print(" ("); Serial.print(porcentajeFuerza, 1); Serial.println("%)");
+    Serial.print("📊 Evaluación general: "); Serial.print(porcentajeGeneral, 1); Serial.println("% de efectividad");
     Serial.println("✅ Entrenamiento terminado. Escribí 'ya' para reiniciar.");
     return;
   }
 
-  
   unsigned long tiempoAhora = millis();
   estadoBotonActual = digitalRead(botonPin);
-  int estadoSensor = digitalRead(sensorPin);  
+  int lectura1 = digitalRead(sensorPin1);
+  int lectura2 = digitalRead(sensorPin2);
 
-  
   if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW && (tiempoAhora - ultimoCambio) > debounceDelay) {
     ultimoCambio = tiempoAhora;
     presionado = true;
-    fuerzaDetectada = false;
-    fuerzaLiberada = false;
-    //Serial.println("🔽 Botón presionado");
+    sensor1Detectado = false;
+    sensor2Detectado = false;
   }
 
-  
   if (presionado) {
-    if (!fuerzaDetectada && estadoSensor == LOW) {
-      fuerzaDetectada = true;
-      //Serial.println("💪 Fuerza detectada");
-    }
+    if (!sensor1Detectado && lectura1 == LOW) sensor1Detectado = true;
+    if (!sensor2Detectado && lectura2 == LOW) sensor2Detectado = true;
 
-    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) {
-      fuerzaLiberada = true;
-      //Serial.println("🛑 Fuerza liberada");
-    }
-
-    
     if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (tiempoAhora - ultimoCambio) > debounceDelay) {
       ultimoCambio = tiempoAhora;
       presionado = false;
       compresionesTotales++;
 
-      //Serial.println("🔼 Botón soltado");
-
-      
-      if (fuerzaDetectada && fuerzaLiberada) {
+      // --- Evaluación de fuerza con 2 sensores ---
+      if (sensor1Detectado && sensor2Detectado) {
         fuerzaCorrecta++;
         Serial.println("✅ Fuerza correcta");
-      } else {
+      } else if (sensor1Detectado && !sensor2Detectado) {
         Serial.println("⚠️ Fuerza insuficiente");
+      } else if (!sensor1Detectado && sensor2Detectado) {
+        Serial.println("⚠️ Fuerza excesiva");
+      } else {
+        Serial.println("⚠️ Sin fuerza detectada");
       }
 
-     
+      // --- Evaluación de ritmo ---
       unsigned long intervalo = tiempoAhora - tiempoAnterior;
       if (intervalo >= intervaloMin && intervalo <= intervaloMax) {
         ritmoCorrecto++;
@@ -137,6 +114,7 @@ void loop() {
       } else {
         Serial.print("⚠️ Ritmo incorrecto: ");
       }
+
       Serial.print(intervalo);
       Serial.println(" ms");
 
