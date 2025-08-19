@@ -1,0 +1,372 @@
+// ==========================
+// ESP32 + DFPlayer + BLE (NimBLE)
+// Servicio GATT para control y envío de resultados
+// ==========================
+
+#include <Arduino.h>
+#include "DFRobotDFPlayerMini.h"
+#include <NimBLEDevice.h>
+
+// --------------------------
+// ===== DFPlayer & IO =====
+// --------------------------
+HardwareSerial mySerial(2);
+DFRobotDFPlayerMini player;
+
+int currentTrack = 1;
+const int botonPin  = 33;
+const int sensorPin = 34;
+
+unsigned long tiempoInicioTrack1 = 0;
+const unsigned long tiempoRequerido = 3000;
+unsigned long tiempoPresionado = 0;
+unsigned long tiempoPresionadoParaReiniciar = 0;
+
+int estadoBotonActual  = HIGH;
+int estadoBotonAnterior= HIGH;
+
+bool track1Reproducido   = false;
+bool esperandoFinTrack1  = false;
+bool entrenamientoIniciado   = false;
+bool entrenamientoFinalizado = false;
+bool track2YaIniciado        = false;
+
+unsigned long tiempoInicio   = 0;   // ventana de 30 s
+unsigned long tiempoAnterior = 0;   // para intervalos entre compresiones
+unsigned long ultimoCambio   = 0;   // anti-rebote
+const unsigned long debounceDelay = 50;
+
+const unsigned long intervaloMin = 450;
+const unsigned long intervaloMax = 650;
+
+int   compresionesTotales = 0;
+int   ritmoCorrecto       = 0;
+int   fuerzaCorrecta      = 0;
+float PrimeraCompresion   = 1.0f;
+
+bool presionado      = false;
+bool fuerzaDetectada = false;
+bool fuerzaLiberada  = false;
+
+// ---------------------------------
+// ===== BLE (NimBLE) PROFILE ======
+// ---------------------------------
+static const char* DEVICE_NAME     = "NeoRCP-ESP32";
+static const char* SERVICE_UUID    = "f0000001-0451-4000-b000-000000000000";
+static const char* CTRL_CHAR_UUID  = "f0000002-0451-4000-b000-000000000000";
+static const char* RES_CHAR_UUID   = "f0000003-0451-4000-b000-000000000000";
+
+static NimBLEServer*         pServer     = nullptr;
+static NimBLECharacteristic* pCtrlChar   = nullptr;
+static NimBLECharacteristic* pResultChar = nullptr;
+
+static bool deviceConnected = false;
+
+// --------------------------
+// ===== Resultados JSON ====
+// --------------------------
+String buildResultJson(
+  int compTot,
+  int ritmoOK,
+  int fuerzaOK,
+  unsigned long ventana_ms = 30000
+) {
+  const float comp2 = max(0, compTot) - PrimeraCompresion; // excluir primera
+  const float pctRitmo  = (comp2 > 0.f) ? (ritmoOK  * 100.0f / comp2)    : 0.f;
+  const float pctFuerza = (comp2 > 0.f) ? (fuerzaOK * 100.0f / compTot) : 0.f;
+
+  // JSON compacto (mantener corto para MTU)
+  // Mapea a "pulsos", "ritmo" (en %), "fuerza" (en %) y "tiempo" (s).
+  String s = "{";
+  s += "\"pulsos\":";   s += String(compTot);       s += ",";
+  s += "\"ritmo\":";    s += String(pctRitmo, 1);   s += ",";
+  s += "\"fuerza\":";   s += String(pctFuerza, 1);  s += ",";
+  s += "\"tiempo\":";   s += String(ventana_ms / 1000);
+  s += "}";
+  return s;
+}
+
+void sendResultJson() {
+  if (!deviceConnected || pResultChar == nullptr) return;
+  String payload = buildResultJson(compresionesTotales, ritmoCorrecto, fuerzaCorrecta, 30000);
+  pResultChar->setValue((uint8_t*)payload.c_str(), payload.length());
+  pResultChar->notify();
+}
+
+// --------------------------
+// ===== BLE Callbacks ======
+// --------------------------
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
+    deviceConnected = true;
+  }
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
+    deviceConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+void iniciarTrack1() {
+  // Arranca Track 1 (introducción) como en tu lógica
+  player.volume(100);
+  player.play(1);
+  esperandoFinTrack1 = true;
+  track1Reproducido  = true;
+  currentTrack       = 1;
+  tiempoInicioTrack1 = millis();
+  Serial.println("Reproduciendo Track 1.");
+}
+
+void iniciarTrack2_yEntrenamiento() {
+  // Igual que tu código original
+  Serial.println("Iniciando Track 2 + entrenamiento (30 s)...");
+  player.volume(15);
+  player.play(2);
+  track2YaIniciado = true;
+
+  entrenamientoIniciado    = true;
+  entrenamientoFinalizado  = false;
+  compresionesTotales = 0;
+  ritmoCorrecto       = 0;
+  fuerzaCorrecta      = 0;
+  tiempoAnterior      = 0;
+  ultimoCambio        = 0;
+  tiempoInicio        = millis();
+  presionado          = false;
+  fuerzaDetectada     = false;
+  fuerzaLiberada      = false;
+}
+
+void resetSistema(bool anunciar = true) {
+  player.stop();
+
+  currentTrack            = 1;
+  track1Reproducido       = false;
+  esperandoFinTrack1      = false;
+  track2YaIniciado        = false;
+  entrenamientoIniciado   = false;
+  entrenamientoFinalizado = false;
+
+  compresionesTotales = 0;
+  ritmoCorrecto       = 0;
+  fuerzaCorrecta      = 0;
+  tiempoPresionado    = 0;
+  tiempoPresionadoParaReiniciar = 0;
+  estadoBotonAnterior = HIGH;
+
+  if (anunciar) {
+    Serial.println("Sistema reiniciado. Mantener boton 3 s para reproducir Track 1, o usar BLE START.");
+  }
+}
+
+class CtrlCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    std::string v = c->getValue();
+    if (v == "START") {
+      // Desde la app: iniciar flujo completo sin esperar pulsación larga
+      if (!track1Reproducido && !esperandoFinTrack1) {
+        iniciarTrack1();
+      } else if (track1Reproducido && !track2YaIniciado && !entrenamientoIniciado) {
+        iniciarTrack2_yEntrenamiento();
+      }
+    } else if (v == "ABORT") {
+      resetSistema();
+    } else if (v == "PING") {
+      // No-op
+    } else if (v.rfind("VOLUME:", 0) == 0) {
+      // Ej: "VOLUME:80"
+      int vol = atoi(v.substr(7).c_str());
+      vol = constrain(vol, 0, 100);
+      player.volume(vol);
+    }
+  }
+};
+
+// --------------------------
+// ===== BLE Setup =========
+// --------------------------
+void setupBLE() {
+  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::setSecurityAuth(false, false, false);
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* svc = pServer->createService(SERVICE_UUID);
+
+  pCtrlChar = svc->createCharacteristic(
+    CTRL_CHAR_UUID,
+    NIMBLE_PROPERTY::WRITE
+  );
+  pCtrlChar->setCallbacks(new CtrlCallbacks());
+
+  pResultChar = svc->createCharacteristic(
+    RES_CHAR_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+}
+
+// --------------------------
+// ===== Arduino Setup =====
+// --------------------------
+void setup() {
+  pinMode(botonPin, INPUT_PULLUP);
+  pinMode(sensorPin, INPUT);
+
+  Serial.begin(115200);
+  mySerial.begin(9600, SERIAL_8N1, 27, 26);
+
+  if (player.begin(mySerial)) {
+    player.volume(100);
+    Serial.println("DFPlayer listo.");
+    Serial.println("Mantener boton 3 s para reproducir Track 1, o usar BLE START.");
+  } else {
+    Serial.println("Error al iniciar DFPlayer.");
+    while (true) { delay(1000); }
+  }
+
+  setupBLE();
+  Serial.println("BLE listo.");
+}
+
+// --------------------------
+// ===== Arduino Loop ======
+// --------------------------
+void loop() {
+  unsigned long ahora = millis();
+  estadoBotonActual = digitalRead(botonPin);
+
+  // ---------- INICIO TRACK 1 (por boton mantenido) ----------
+  if (!track1Reproducido) {
+    if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW) {
+      tiempoPresionado = ahora;
+    }
+    if (estadoBotonAnterior == LOW && estadoBotonActual == LOW &&
+        (ahora - tiempoPresionado >= tiempoRequerido)) {
+      iniciarTrack1();
+    }
+    estadoBotonAnterior = estadoBotonActual;
+    // Aún no hay nada más que hacer si Track1 no se reprodujo
+  } else {
+    // ---------- ESPERAR FIN TRACK 1 ----------
+    if (esperandoFinTrack1 && player.available()) {
+      // Para evitar falsos positivos, esperamos al menos 10 s de reproducción
+      if ((millis() - tiempoInicioTrack1 > 10000) &&
+          player.readType() == DFPlayerPlayFinished &&
+          currentTrack == 1) {
+        esperandoFinTrack1 = false;
+        currentTrack = 2;
+      }
+    }
+
+    // ---------- INICIO ENTRENAMIENTO (TRACK 2) ----------
+    if (currentTrack == 2 && !track2YaIniciado) {
+      iniciarTrack2_yEntrenamiento();
+    }
+
+    // ---------- FIN ENTRENAMIENTO + REINICIO ----------
+    if (entrenamientoIniciado && !entrenamientoFinalizado &&
+        millis() - tiempoInicio >= 30000) {
+      entrenamientoFinalizado = true;
+
+      // Log de resultados en Serial
+      const float comp2 = (float)compresionesTotales - PrimeraCompresion;
+      const float pctRitmo  = (comp2 > 0.f) ? (ritmoCorrecto  * 100.0f / comp2)   : 0.f;
+      const float pctFuerza = (comp2 > 0.f) ? (fuerzaCorrecta * 100.0f / compresionesTotales) : 0.f;
+      const float pctGen    = (pctRitmo + pctFuerza) / 2.0f;
+
+      Serial.println("Tiempo finalizado.");
+      Serial.print("Total de compresiones: "); Serial.println(compresionesTotales);
+      Serial.print("Ritmo correcto: ");        Serial.print(ritmoCorrecto);
+      Serial.print(" (");                      Serial.print(pctRitmo, 1);  Serial.println("%)");
+      Serial.print("Fuerza correcta: ");       Serial.print(fuerzaCorrecta);
+      Serial.print(" (");                      Serial.print(pctFuerza, 1); Serial.println("%)");
+      Serial.print("Evaluacion general: ");    Serial.print(pctGen, 1);     Serial.println("%");
+
+      // Enviar JSON por BLE (Notify)
+      sendResultJson();
+
+      Serial.println("Entrenamiento terminado. Mantener boton 3 s para reiniciar, o enviar ABORT por BLE para resetear.");
+    }
+
+    if (entrenamientoFinalizado) {
+      // Permitir reinicio por boton mantenido
+      if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW) {
+        tiempoPresionadoParaReiniciar = ahora;
+      }
+      if (estadoBotonAnterior == LOW && estadoBotonActual == LOW &&
+          (ahora - tiempoPresionadoParaReiniciar >= tiempoRequerido)) {
+        Serial.println("Reiniciando sistema...");
+        resetSistema();
+        estadoBotonAnterior = estadoBotonActual;
+        return;
+      }
+      estadoBotonAnterior = estadoBotonActual;
+      return; // nada mas si ya finalizo (hasta reinicio)
+    }
+
+    // ---------- MEDIR COMPRESIONES ----------
+    if (!entrenamientoIniciado || entrenamientoFinalizado) {
+      estadoBotonAnterior = estadoBotonActual;
+      return;
+    }
+
+    unsigned long tiempoAhora = millis();
+    int estadoSensor = digitalRead(sensorPin);
+
+    // Detección de inicio de compresión (boton)
+    if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW &&
+        (tiempoAhora - ultimoCambio) > debounceDelay) {
+      ultimoCambio = tiempoAhora;
+      presionado = true;
+      fuerzaDetectada = false;
+      fuerzaLiberada  = false;
+    }
+
+    if (presionado) {
+      if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;
+      if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true;
+
+      // Fin de compresión (se soltó el boton)
+      if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH &&
+          (tiempoAhora - ultimoCambio) > debounceDelay) {
+        ultimoCambio = tiempoAhora;
+        presionado = false;
+        compresionesTotales++;
+
+        if (fuerzaDetectada && fuerzaLiberada) {
+          fuerzaCorrecta++;
+          Serial.println("Fuerza correcta");
+        } else {
+          Serial.println("Fuerza insuficiente");
+        }
+
+        unsigned long intervalo = tiempoAhora - tiempoAnterior;
+        if (intervalo >= intervaloMin && intervalo <= intervaloMax) {
+          ritmoCorrecto++;
+          Serial.print("Ritmo correcto: ");
+        } else {
+          Serial.print("Ritmo incorrecto: ");
+        }
+        Serial.print(intervalo);
+        Serial.println(" ms");
+
+        tiempoAnterior = tiempoAhora;
+      }
+    }
+
+    estadoBotonAnterior = estadoBotonActual;
+  }
+
+  // loop base
+  delay(2);
+}
