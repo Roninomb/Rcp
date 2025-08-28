@@ -1,0 +1,236 @@
+Code gemini, ble, command start.
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ArduinoJson.h> // Make sure to install this library
+
+// Pines
+const int botonPin = 35;
+const int sensorPin = 34;
+
+// Estado del botón
+int estadoBotonActual = HIGH;
+int estadoBotonAnterior = HIGH;
+
+// Temporizadores
+unsigned long tiempoAnterior = 0;
+unsigned long ultimoCambio = 0;
+unsigned long tiempoInicio = 0;
+unsigned long tiempoEnvio = 0;
+
+// Intervalos permitidos
+const unsigned long intervaloMin = 450;
+const unsigned long intervaloMax = 650;
+const unsigned long debounceDelay = 50;
+
+// Métricas de entrenamiento
+int compresionesTotales = 0;
+int ritmoCorrecto = 0;
+int fuerzaCorrecta = 0;
+int compresionesEnCurso = 0;
+
+// Estados del entrenamiento
+bool entrenamientoIniciado = false;
+bool entrenamientoFinalizado = false;
+
+// Flags internos
+bool presionado = false;
+bool fuerzaDetectada = false;
+bool fuerzaLiberada = false;
+
+// BLE
+BLECharacteristic* pCharacteristic;
+bool bleConectado = false;
+
+// Ajusta estos UUIDs para que coincidan con tu app de Flutter
+#define SERVICE_UUID        "f0000001-0451-4000-b000-000000000000"
+#define CTRL_CHAR_UUID      "f0000002-0451-4000-b000-000000000000" // Para recibir comandos
+#define RESULT_CHAR_UUID    "f0000003-0451-4000-b000-000000000000" // Para enviar datos
+
+class MyCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    bleConectado = true;
+    Serial.println("📲 App conectada");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    bleConectado = false;
+    Serial.println("📴 App desconectada");
+  }
+};
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    std::string rxValue = pCharacteristic->getValue();
+    if (rxValue.length() > 0) {
+      String command = String(rxValue.c_str()).trim();
+      Serial.print("Comando recibido: ");
+      Serial.println(command);
+      if (command.equalsIgnoreCase("START")) {
+        // Reiniciar el entrenamiento con el comando 'START' de la app
+        entrenamientoIniciado = true;
+        entrenamientoFinalizado = false;
+        compresionesTotales = 0;
+        ritmoCorrecto = 0;
+        fuerzaCorrecta = 0;
+        compresionesEnCurso = 0;
+        tiempoAnterior = 0;
+        ultimoCambio = 0;
+        tiempoInicio = millis();
+        presionado = false;
+        fuerzaDetectada = false;
+        fuerzaLiberada = false;
+        Serial.println("🔁 Entrenamiento iniciado por comando 'START'.");
+      }
+    }
+  }
+};
+
+void iniciarBLE() {
+  BLEDevice::init("NeoRCP");
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  
+  // Característica para recibir comandos (escribir)
+  BLECharacteristic* pCtrlChar = pService->createCharacteristic(
+      CTRL_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE
+  );
+  pCtrlChar->setCallbacks(new MyCharacteristicCallbacks());
+
+  // Característica para enviar resultados (notificar)
+  pCharacteristic = pService->createCharacteristic(
+      RESULT_CHAR_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("🟢 BLE iniciado. Esperando conexión de la app...");
+}
+
+void enviarDatos(int pulsos, int fuerza, bool ritmo, bool fuerzaOK) {
+  if (!bleConectado) return;
+
+  // Usa un objeto JSON para estructurar los datos
+  StaticJsonDocument<200> doc;
+  doc["pulsos"] = pulsos;
+  doc["fuerza"] = fuerza;
+  doc["ritmo"] = ritmo;
+  doc["fuerzaOK"] = fuerzaOK;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  // Agrega el salto de línea para que la app sepa que el mensaje está completo
+  jsonString += "\n";
+  
+  pCharacteristic->setValue(jsonString.c_str());
+  pCharacteristic->notify();
+  Serial.print("📤 Enviando: ");
+  Serial.print(jsonString);
+}
+
+void setup() {
+  pinMode(botonPin, INPUT_PULLUP);
+  pinMode(sensorPin, INPUT);
+  Serial.begin(115200);
+
+  iniciarBLE();
+}
+
+void loop() {
+  // Comprobación de que el entrenamiento ha iniciado
+  if (!entrenamientoIniciado) return;
+
+  // Final del entrenamiento (20 segundos)
+  if (millis() - tiempoInicio >= 20000) {
+    entrenamientoFinalizado = true;
+
+    // Calcular porcentajes
+    float porcentajeRitmo = (compresionesTotales > 0) ? (ritmoCorrecto * 100.0 / compresionesTotales) : 0;
+    float porcentajeFuerza = (compresionesTotales > 0) ? (fuerzaCorrecta * 100.0 / compresionesTotales) : 0;
+    float porcentajeGeneral = (porcentajeRitmo + porcentajeFuerza) / 2.0;
+
+    // Enviar resultados finales como JSON
+    StaticJsonDocument<250> doc;
+    doc["compresiones_totales"] = compresionesTotales;
+    doc["ritmo_correcto"] = porcentajeRitmo;
+    doc["fuerza_correcta"] = porcentajeFuerza;
+    doc["evaluacion_general"] = porcentajeGeneral;
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    jsonString += "\n";
+
+    if (bleConectado) {
+      pCharacteristic->setValue(jsonString.c_str());
+      pCharacteristic->notify();
+    }
+    Serial.print("✅ Entrenamiento terminado. Resultados finales enviados: ");
+    Serial.println(jsonString);
+    
+    // Detiene el loop hasta que se reciba un nuevo comando START
+    entrenamientoIniciado = false;
+    return;
+  }
+  
+  // Lógica de detección de compresión
+  estadoBotonActual = digitalRead(botonPin);
+  int estadoSensor = digitalRead(sensorPin);
+
+  if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW && (millis() - ultimoCambio) > debounceDelay) {
+    ultimoCambio = millis();
+    presionado = true;
+    fuerzaDetectada = false;
+    fuerzaLiberada = false;
+  }
+
+  if (presionado) {
+    if (!fuerzaDetectada && estadoSensor == LOW) {
+      fuerzaDetectada = true;
+    }
+
+    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) {
+      fuerzaLiberada = true;
+    }
+
+    if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (millis() - ultimoCambio) > debounceDelay) {
+      ultimoCambio = millis();
+      presionado = false;
+      compresionesTotales++;
+      compresionesEnCurso++;
+
+      bool fuerzaOK = (fuerzaDetectada && fuerzaLiberada);
+      if (fuerzaOK) {
+        fuerzaCorrecta++;
+        Serial.println("✅ Fuerza correcta");
+      } else {
+        Serial.println("⚠️ Fuerza insuficiente");
+      }
+
+      unsigned long intervalo = millis() - tiempoAnterior;
+      bool ritmoOK = (intervalo >= intervaloMin && intervalo <= intervaloMax);
+
+      if (ritmoOK) {
+        ritmoCorrecto++;
+        Serial.print("✅ Ritmo correcto: ");
+      } else {
+        Serial.print("⚠️ Ritmo incorrecto: ");
+      }
+      Serial.print(intervalo);
+      Serial.println(" ms");
+
+      tiempoAnterior = millis();
+
+      // Enviar datos instantáneos después de cada compresión
+      enviarDatos(compresionesEnCurso, fuerzaCorrecta, ritmoOK, fuerzaOK);
+    }
+  }
+
+  estadoBotonAnterior = estadoBotonActual;
+}
