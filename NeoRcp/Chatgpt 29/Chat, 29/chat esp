@@ -1,30 +1,28 @@
 // === NeoRCP ESP32 (NimBLE) ===
-// Recibe "START" por BLE y, al terminar, envía JSON final por Notify.
-// Incluye: CCCD 0x2902, ACK de START, ticks por segundo y 3 reintentos del notify final.
-// Librería: NimBLE-Arduino (https://github.com/h2zero/NimBLE-Arduino)
+// Envía ACK al START, ticks cada 1s y JSON final por Notify (con \n).
+// Reintenta 3 veces el notify final. Duración de test: 5s.
+// Librería: NimBLE-Arduino
 
 #include <NimBLEDevice.h>
 #include <math.h>
 
-// ---------------- Pines ----------------
-const int botonPin  = 35;   // ⚠️ requiere pull-up externo (mejor usar 32/33/25/26)
-const int sensorPin = 34;   // fuerza: LOW/HIGH
+// -------- Pines --------
+const int botonPin  = 35;   // ⚠️ requiere pull-up externo (mejor 32/33/25/26)
+const int sensorPin = 34;
 
-// ---------------- Parámetros entrenamiento ----------------
+// -------- Parámetros entrenamiento --------
 int estadoBotonActual   = HIGH;
 int estadoBotonAnterior = HIGH;
-
-float PrimeraCompresion   = 1;
+float PrimeraCompresion = 1;
 unsigned long tiempoAnterior = 0;
 unsigned long ultimoCambio   = 0;
 
-// Ventana de ritmo correcto
-const unsigned long intervaloMin  = 450;   // ms
-const unsigned long intervaloMax  = 650;   // ms
-const unsigned long debounceDelay = 50;    // ms
+const unsigned long intervaloMin  = 450;
+const unsigned long intervaloMax  = 650;
+const unsigned long debounceDelay = 50;
 
-// ⏱️ Duración (para test está en 5 s; luego ponelo en 20000)
-const unsigned long DURACION_MS   = 5000;  // 20_000 en producción
+// ⏱️ Test rápido (luego cambiá a 20000)
+const unsigned long DURACION_MS = 5000;
 
 int compresionesTotales = 0;
 int ritmoCorrecto       = 0;
@@ -34,24 +32,22 @@ unsigned long tiempoInicio   = 0;
 bool entrenamientoIniciado   = false;
 bool entrenamientoFinalizado = false;
 
-// Banderas por compresión
 bool presionado      = false;
 bool fuerzaDetectada = false;
 bool fuerzaLiberada  = false;
 
-// Tick de diagnóstico
 unsigned long ultimoTick = 0;
 
-// ---------------- BLE (UUIDs deben coincidir con la app) ----------------
+// -------- BLE UUIDs (coinciden con la app) --------
 #define SVC_UUID "f0000001-0451-4000-b000-000000000000"
-#define RX_UUID  "f0000002-0451-4000-b000-000000000000" // Write (App -> ESP32)
-#define TX_UUID  "f0000003-0451-4000-b000-000000000000" // Notify (ESP32 -> App)
+#define RX_UUID  "f0000002-0451-4000-b000-000000000000" // Write
+#define TX_UUID  "f0000003-0451-4000-b000-000000000000" // Notify
 
-NimBLEServer*         g_server   = nullptr;
-NimBLECharacteristic* g_txChar   = nullptr;
-bool                  g_deviceConnected = false;
+NimBLEServer*         g_server  = nullptr;
+NimBLECharacteristic* g_txChar  = nullptr;
+bool g_deviceConnected = false;
 
-// ---------------- Utilidades ----------------
+// -------- Utilidades --------
 void resetEntrenamiento() {
   compresionesTotales = 0;
   ritmoCorrecto       = 0;
@@ -64,30 +60,26 @@ void resetEntrenamiento() {
   ultimoTick          = 0;
 }
 
+void bleNotifyLine(const String& s) {
+  if (!g_txChar) return;
+  String line = s.endsWith("\n") ? s : (s + "\n");
+  int subs = g_txChar->getSubscribedCount();
+  Serial.printf("🔔 notify len=%d subs=%d conn=%d\n", line.length(), subs, (int)g_deviceConnected);
+  g_txChar->setValue((uint8_t*)line.c_str(), line.length());
+  g_txChar->notify();
+}
+
+void sendAckStart() {
+  bleNotifyLine("{\"ack\":\"start\"}");
+  Serial.println("📤 ACK START enviado");
+}
+
 void iniciarEntrenamiento() {
   entrenamientoIniciado   = true;
   entrenamientoFinalizado = false;
   resetEntrenamiento();
   tiempoInicio = millis();
   Serial.println("🔁 Entrenamiento iniciado");
-}
-
-void bleNotifyLine(const String& s) {
-  if (!g_txChar) {
-    Serial.println("⚠️ TX char nula, no se notifica");
-    return;
-  }
-  String line = s.endsWith("\n") ? s : (s + "\n");
-  int subs = g_txChar->getSubscribedCount();
-  Serial.printf("🔔 notify(len=%d) subs=%d connected=%d\n",
-                line.length(), subs, (int)g_deviceConnected);
-  g_txChar->setValue((uint8_t*)line.c_str(), line.length());
-  g_txChar->notify(); // no bloqueamos si subs==0 (para test).
-}
-
-void sendAckStart() {
-  bleNotifyLine("{\"ack\":\"start\"}");
-  Serial.println("📤 ACK START enviado");
 }
 
 void enviarJsonFinalYTerminar() {
@@ -110,7 +102,7 @@ void enviarJsonFinalYTerminar() {
   Serial.println("📤 JSON final:");
   Serial.println(json);
 
-  // Reintentos por si la primera notificación no llega
+  // Reintenta 3 veces por seguridad
   for (int i = 0; i < 3; ++i) {
     Serial.printf("🔁 Notificando resultado (intento %d)\n", i + 1);
     bleNotifyLine(json);
@@ -118,7 +110,7 @@ void enviarJsonFinalYTerminar() {
   }
 }
 
-// ---------------- Callbacks BLE ----------------
+// -------- Callbacks BLE --------
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer) override {
     g_deviceConnected = true;
@@ -142,20 +134,20 @@ class RxCB : public NimBLECharacteristicCallbacks {
     Serial.print("📥 CMD: "); Serial.println(cmd);
 
     if (cmd == "START") {
-      sendAckStart();      // confirma camino de notify
+      sendAckStart();
       iniciarEntrenamiento();
     } else if (cmd == "STOP") {
       entrenamientoIniciado = false;
       entrenamientoFinalizado = true;
       Serial.println("⛔ STOP recibido");
     } else if (cmd == "TEST") {
-      Serial.println("🧪 TEST -> enviando JSON final inmediato");
+      Serial.println("🧪 TEST -> JSON final inmediato");
       enviarJsonFinalYTerminar();
     }
   }
 };
 
-// ---------------- Setup BLE ----------------
+// -------- Setup BLE --------
 void setupBLE() {
   NimBLEDevice::init("NeoRCP");
   NimBLEDevice::setPower(ESP_PWR_LVL_P7);
@@ -166,12 +158,12 @@ void setupBLE() {
 
   NimBLEService* svc = g_server->createService(SVC_UUID);
 
-  // TX: Notify + CCCD
+  // TX: Notify + CCCD (indispensable para Android)
   g_txChar = svc->createCharacteristic(
       TX_UUID,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
-  g_txChar->addDescriptor(new NimBLE2902()); // permite que Android habilite notificaciones
+  g_txChar->addDescriptor(new NimBLE2902());
 
   // RX: Write (comandos)
   NimBLECharacteristic* rx = svc->createCharacteristic(
@@ -191,43 +183,40 @@ void setupBLE() {
   Serial.println("📡 Advertising iniciado: NeoRCP");
 }
 
-// ---------------- Arduino setup/loop ----------------
+// -------- Arduino setup/loop --------
 void setup() {
   Serial.begin(115200);
-  pinMode(botonPin, INPUT_PULLUP); // ⚠️ 35 no tiene pull-up interno: usar resistencia externa
+  pinMode(botonPin, INPUT_PULLUP); // ⚠️ 35 sin pull-up interno -> usar resistencia externa
   pinMode(sensorPin, INPUT);
 
   setupBLE();
-  Serial.println("Listo. Enviar START/TEST por BLE (o 'YA' por Serial).");
+  Serial.println("Listo. Mandá START/TEST por BLE (o 'YA' por Serial).");
 }
 
 void loop() {
   // Debug por Serial
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n'); cmd.trim(); cmd.toUpperCase();
-    if (cmd == "YA") {
-      sendAckStart();
-      iniciarEntrenamiento();
-    } else if (cmd == "TEST") {
-      enviarJsonFinalYTerminar();
-    }
+    if (cmd == "YA")  { sendAckStart(); iniciarEntrenamiento(); }
+    if (cmd == "TEST"){ enviarJsonFinalYTerminar(); }
   }
 
   if (!entrenamientoIniciado || entrenamientoFinalizado) return;
 
-  // Timeout de entrenamiento
+  // Timeout del entrenamiento
   if (millis() - tiempoInicio >= DURACION_MS) {
     Serial.println("⏱️ Timeout alcanzado, enviando JSON final");
     enviarJsonFinalYTerminar();
     return;
   }
 
-  // Ticks de diagnóstico (1/s)
+  // Ticks de diagnóstico (1/s) -> verás en Flutter como [BLE][notify] {"tick":"n"}
   if (millis() - ultimoTick >= 1000) {
     ultimoTick = millis();
     bleNotifyLine(String("{\"tick\":\"") + String((millis() - tiempoInicio) / 1000) + "\"}");
   }
 
+  // --- Lógica de botón/sensor (no afecta al envío final por timeout) ---
   unsigned long t = millis();
   estadoBotonActual = digitalRead(botonPin);
   int estadoSensor  = digitalRead(sensorPin);
@@ -241,8 +230,8 @@ void loop() {
   }
 
   if (presionado) {
-    if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;   // fuerza aplicada
-    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true; // liberada
+    if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;
+    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true;
 
     // Flanco de subida (soltar)
     if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (t - ultimoCambio) > debounceDelay) {
@@ -250,14 +239,10 @@ void loop() {
       presionado   = false;
       compresionesTotales++;
 
-      if (fuerzaDetectada && fuerzaLiberada) {
-        fuerzaCorrecta++;
-      }
+      if (fuerzaDetectada && fuerzaLiberada) fuerzaCorrecta++;
 
       unsigned long intervalo = t - tiempoAnterior;
-      if (intervalo >= intervaloMin && intervalo <= intervaloMax) {
-        ritmoCorrecto++;
-      }
+      if (intervalo >= intervaloMin && intervalo <= intervaloMax) ritmoCorrecto++;
       tiempoAnterior = t;
     }
   }
