@@ -1,0 +1,222 @@
+// === NeoRCP ESP32 (NimBLE) ===
+// Recibe "START" por BLE (Write) y, al terminar 20s, envía un JSON por Notify.
+// UUIDs alineados con tu app Flutter.
+//
+// Requiere: Librería "NimBLE-Arduino"
+
+#include <NimBLEDevice.h>
+
+// ---------------- Pines (como tu sketch) ----------------
+const int botonPin  = 35;    // OJO: sin pull-up interno
+const int sensorPin = 34;    // HIGH/LOW de fuerza
+
+// ---------------- Lógica de entrenamiento ----------------
+int estadoBotonActual   = HIGH;
+int estadoBotonAnterior = HIGH;
+
+float PrimeraCompresion = 1;
+unsigned long tiempoAnterior = 0;
+unsigned long ultimoCambio   = 0;
+
+const unsigned long intervaloMin  = 450;   // ms
+const unsigned long intervaloMax  = 650;   // ms
+const unsigned long debounceDelay = 50;    // ms
+const unsigned long DURACION_MS   = 20000; // 20 s
+
+int compresionesTotales = 0;
+int ritmoCorrecto       = 0;
+int fuerzaCorrecta      = 0;
+
+unsigned long tiempoInicio   = 0;
+bool entrenamientoIniciado   = false;
+bool entrenamientoFinalizado = false;
+
+// Banderas por compresión
+bool presionado      = false;
+bool fuerzaDetectada = false;
+bool fuerzaLiberada  = false;
+
+// ---------------- BLE (UUIDs de tu app) ----------------
+#define SVC_UUID   "f0000001-0451-4000-b000-000000000000"
+#define RX_UUID    "f0000002-0451-4000-b000-000000000000" // Write (App -> ESP32)
+#define TX_UUID    "f0000003-0451-4000-b000-000000000000" // Notify (ESP32 -> App)
+
+NimBLEServer*        g_server  = nullptr;
+NimBLECharacteristic* g_txChar = nullptr;
+bool g_deviceConnected = false;
+
+// ---------------- Utilidades ----------------
+void resetEntrenamiento() {
+  compresionesTotales = 0;
+  ritmoCorrecto       = 0;
+  fuerzaCorrecta      = 0;
+  tiempoAnterior      = 0;
+  ultimoCambio        = 0;
+  presionado          = false;
+  fuerzaDetectada     = false;
+  fuerzaLiberada      = false;
+}
+
+void iniciarEntrenamiento() {
+  entrenamientoIniciado   = true;
+  entrenamientoFinalizado = false;
+  resetEntrenamiento();
+  tiempoInicio = millis();
+  Serial.println("🔁 Entrenamiento iniciado: 20s");
+}
+
+void enviarJsonFinalYTerminar() {
+  entrenamientoFinalizado = true;
+  entrenamientoIniciado   = false;
+
+  float compresionesTotales2 = compresionesTotales - PrimeraCompresion;
+  float pctRitmo   = (compresionesTotales2 > 0) ? (ritmoCorrecto  * 100.0 / compresionesTotales2) : 0.0;
+  float pctFuerza  = (compresionesTotales  > 0) ? (fuerzaCorrecta * 100.0 / compresionesTotales)  : 0.0;
+  float pctGeneral = (pctRitmo + pctFuerza) / 2.0;
+
+  int fuerzaPct = (int)roundf(pctFuerza);
+  bool ritmoOK  = (pctRitmo >= 60.0);  // umbral simple
+
+  // JSON que tu app espera (strings y boolean como "true"/"false")
+  String json = String("{")
+                + "\"fuerza\":\"" + String(fuerzaPct) + "\","
+                + "\"pulsos\":\"" + String(compresionesTotales) + "\","
+                + "\"ritmo\":\""  + String(ritmoOK ? "true" : "false") + "\""
+                + "}";
+
+  Serial.println("📤 JSON final:");
+  Serial.println(json);
+
+  if (g_deviceConnected && g_txChar) {
+    String payload = json + "\n";             // IMPORTANTE: terminador de línea
+    g_txChar->setValue((uint8_t*)payload.c_str(), payload.length());
+    g_txChar->notify();
+  } else {
+    Serial.println("⚠️ Sin central conectada: no se pudo notificar.");
+  }
+}
+
+// ---------------- Callbacks BLE ----------------
+class ServerCB : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*) override {
+    g_deviceConnected = true;
+    Serial.println("✅ Central conectada");
+  }
+  void onDisconnect(NimBLEServer* s) override {
+    g_deviceConnected = false;
+    Serial.println("🚪 Central desconectada");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (v.empty()) return;
+    String cmd;
+    for (char ch : v) cmd += ch;
+    cmd.trim(); cmd.toUpperCase();
+    Serial.print("📥 CMD: "); Serial.println(cmd);
+
+    if (cmd == "START") {
+      iniciarEntrenamiento();
+    } else if (cmd == "STOP") {
+      entrenamientoIniciado = false;
+      entrenamientoFinalizado = true;
+      Serial.println("⛔ STOP recibido");
+    }
+  }
+};
+
+// ---------------- Setup/Loop ----------------
+void setupBLE() {
+  NimBLEDevice::init("NeoRCP");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+  NimBLEDevice::setMTU(185);
+
+  g_server = NimBLEDevice::createServer();
+  g_server->setCallbacks(new ServerCB());
+
+  auto svc = g_server->createService(SVC_UUID);
+
+  // TX: Notify (resultados)
+  g_txChar = svc->createCharacteristic(
+      TX_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
+  // RX: Write (comandos)
+  auto rx = svc->createCharacteristic(
+      RX_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  rx->setCallbacks(new RxCB());
+
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  Serial.println("📡 Advertising: NeoRCP");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(botonPin, INPUT_PULLUP); // ⚠️ pull-up externo si usás GPIO35
+  pinMode(sensorPin, INPUT);
+  setupBLE();
+  Serial.println("Esperando START por BLE (o escribir 'YA' por Serial para test).");
+}
+
+void loop() {
+  // Opción debug por Serial: "YA"
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n'); cmd.trim(); cmd.toUpperCase();
+    if (cmd == "YA") iniciarEntrenamiento();
+  }
+
+  if (!entrenamientoIniciado || entrenamientoFinalizado) return;
+
+  // Timeout 20s
+  if (millis() - tiempoInicio >= DURACION_MS) {
+    enviarJsonFinalYTerminar();
+    return;
+  }
+
+  unsigned long t = millis();
+  estadoBotonActual = digitalRead(botonPin);
+  int estadoSensor  = digitalRead(sensorPin);
+
+  // Flanco de bajada (apretar)
+  if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW && (t - ultimoCambio) > debounceDelay) {
+    ultimoCambio    = t;
+    presionado      = true;
+    fuerzaDetectada = false;
+    fuerzaLiberada  = false;
+  }
+
+  if (presionado) {
+    if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;  // fuerza aplicada
+    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true; // liberada
+
+    // Flanco de subida (soltar)
+    if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (t - ultimoCambio) > debounceDelay) {
+      ultimoCambio = t;
+      presionado   = false;
+      compresionesTotales++;
+
+      if (fuerzaDetectada && fuerzaLiberada) {
+        fuerzaCorrecta++;
+      }
+
+      unsigned long intervalo = t - tiempoAnterior;
+      if (intervalo >= intervaloMin && intervalo <= intervaloMax) {
+        ritmoCorrecto++;
+      }
+      tiempoAnterior = t;
+    }
+  }
+
+  estadoBotonAnterior = estadoBotonActual;
+}
