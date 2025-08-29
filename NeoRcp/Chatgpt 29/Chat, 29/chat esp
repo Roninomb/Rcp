@@ -1,24 +1,30 @@
 // === NeoRCP ESP32 (NimBLE) ===
-// Recibe "START" por BLE y, al terminar 20s, envía JSON por Notify.
+// Recibe "START" por BLE y, al terminar, envía JSON final por Notify.
+// Incluye: CCCD 0x2902, ACK de START, ticks por segundo y 3 reintentos del notify final.
+// Librería: NimBLE-Arduino (https://github.com/h2zero/NimBLE-Arduino)
+
 #include <NimBLEDevice.h>
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 35;   // ⚠ sin pull-up interno (usa resistencia externa o cambia a 32/33/25/26)
-const int sensorPin = 34;
+const int botonPin  = 35;   // ⚠️ requiere pull-up externo (mejor usar 32/33/25/26)
+const int sensorPin = 34;   // fuerza: LOW/HIGH
 
-// ---------------- Lógica de entrenamiento ----------------
+// ---------------- Parámetros entrenamiento ----------------
 int estadoBotonActual   = HIGH;
 int estadoBotonAnterior = HIGH;
 
-float PrimeraCompresion = 1;
+float PrimeraCompresion   = 1;
 unsigned long tiempoAnterior = 0;
 unsigned long ultimoCambio   = 0;
 
+// Ventana de ritmo correcto
 const unsigned long intervaloMin  = 450;   // ms
 const unsigned long intervaloMax  = 650;   // ms
 const unsigned long debounceDelay = 50;    // ms
-const unsigned long DURACION_MS   = 20000; // 20 s
+
+// ⏱️ Duración (para test está en 5 s; luego ponelo en 20000)
+const unsigned long DURACION_MS   = 5000;  // 20_000 en producción
 
 int compresionesTotales = 0;
 int ritmoCorrecto       = 0;
@@ -33,39 +39,19 @@ bool presionado      = false;
 bool fuerzaDetectada = false;
 bool fuerzaLiberada  = false;
 
-// ---------------- BLE (UUIDs) ----------------
+// Tick de diagnóstico
+unsigned long ultimoTick = 0;
+
+// ---------------- BLE (UUIDs deben coincidir con la app) ----------------
 #define SVC_UUID "f0000001-0451-4000-b000-000000000000"
 #define RX_UUID  "f0000002-0451-4000-b000-000000000000" // Write (App -> ESP32)
 #define TX_UUID  "f0000003-0451-4000-b000-000000000000" // Notify (ESP32 -> App)
 
-NimBLEServer*         g_server  = nullptr;
-NimBLECharacteristic* g_txChar  = nullptr;
-bool g_deviceConnected = false;
+NimBLEServer*         g_server   = nullptr;
+NimBLECharacteristic* g_txChar   = nullptr;
+bool                  g_deviceConnected = false;
 
-// Si llega START antes de que Android termine de suscribirse, guardamos un ACK pendiente
-bool g_ackStartPendiente = false;
-
-// ---------- Utils de notificación ----------
-void bleNotifyLine(const String& s) {
-  if (!g_deviceConnected || g_txChar == nullptr) {
-    Serial.println("⚠️ No hay central conectada o TX nulo; no se notifica.");
-    return;
-  }
-  if (g_txChar->getSubscribedCount() == 0) {
-    Serial.println("⚠️ Aún no hay suscriptores al TX (CCCD no habilitado).");
-    return;
-  }
-  String line = s.endsWith("\n") ? s : (s + "\n");   // SIEMPRE '\n'
-  g_txChar->setValue((uint8_t*)line.c_str(), line.length());
-  g_txChar->notify();
-}
-
-void sendAckStart() {
-  bleNotifyLine("{\"ack\":\"start\"}");
-  Serial.println("📤 ACK START enviado");
-}
-
-// ---------------- Lógica ----------------
+// ---------------- Utilidades ----------------
 void resetEntrenamiento() {
   compresionesTotales = 0;
   ritmoCorrecto       = 0;
@@ -75,6 +61,7 @@ void resetEntrenamiento() {
   presionado          = false;
   fuerzaDetectada     = false;
   fuerzaLiberada      = false;
+  ultimoTick          = 0;
 }
 
 void iniciarEntrenamiento() {
@@ -82,7 +69,25 @@ void iniciarEntrenamiento() {
   entrenamientoFinalizado = false;
   resetEntrenamiento();
   tiempoInicio = millis();
-  Serial.println("🔁 Entrenamiento iniciado: 20s");
+  Serial.println("🔁 Entrenamiento iniciado");
+}
+
+void bleNotifyLine(const String& s) {
+  if (!g_txChar) {
+    Serial.println("⚠️ TX char nula, no se notifica");
+    return;
+  }
+  String line = s.endsWith("\n") ? s : (s + "\n");
+  int subs = g_txChar->getSubscribedCount();
+  Serial.printf("🔔 notify(len=%d) subs=%d connected=%d\n",
+                line.length(), subs, (int)g_deviceConnected);
+  g_txChar->setValue((uint8_t*)line.c_str(), line.length());
+  g_txChar->notify(); // no bloqueamos si subs==0 (para test).
+}
+
+void sendAckStart() {
+  bleNotifyLine("{\"ack\":\"start\"}");
+  Serial.println("📤 ACK START enviado");
 }
 
 void enviarJsonFinalYTerminar() {
@@ -104,60 +109,53 @@ void enviarJsonFinalYTerminar() {
 
   Serial.println("📤 JSON final:");
   Serial.println(json);
-  bleNotifyLine(json);
+
+  // Reintentos por si la primera notificación no llega
+  for (int i = 0; i < 3; ++i) {
+    Serial.printf("🔁 Notificando resultado (intento %d)\n", i + 1);
+    bleNotifyLine(json);
+    delay(120);
+  }
 }
 
 // ---------------- Callbacks BLE ----------------
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
+  void onConnect(NimBLEServer* pServer) override {
     g_deviceConnected = true;
-    Serial.printf("✅ Central conectada: %s\n", info.getAddress().toString().c_str());
+    Serial.println("✅ Central conectada");
   }
-  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
+  void onDisconnect(NimBLEServer* pServer) override {
     g_deviceConnected = false;
     Serial.println("🚪 Central desconectada. Re-Advertising…");
     NimBLEDevice::startAdvertising();
   }
 };
 
-// Para loguear suscripciones al TX (CCCD 0x2902)
-class TxCB : public NimBLECharacteristicCallbacks {
-  void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info, uint16_t subValue) override {
-    Serial.printf("📡 TX subscribed from %s, value=0x%04x, subs=%d\n",
-                  info.getAddress().toString().c_str(), subValue, c->getSubscribedCount());
-    if (g_ackStartPendiente) {
-      sendAckStart();
-      g_ackStartPendiente = false;
-    }
-  }
-};
-
 class RxCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& info) override {
-    std::string v = c->getValue();
+  void onWrite(NimBLECharacteristic* pCharacteristic) override {
+    std::string v = pCharacteristic->getValue();
     if (v.empty()) return;
-    String cmd; for (char ch: v) cmd += ch;
+    String cmd;
+    for (char ch : v) cmd += ch;
     cmd.trim(); cmd.toUpperCase();
+
     Serial.print("📥 CMD: "); Serial.println(cmd);
 
     if (cmd == "START") {
-      // ACK si ya hay suscripción; si no, quedará pendiente y se manda en onSubscribe
-      if (g_txChar && g_txChar->getSubscribedCount() > 0) {
-        sendAckStart();
-      } else {
-        Serial.println("⌛ ACK START pendiente (aún sin suscriptores)");
-        g_ackStartPendiente = true;
-      }
+      sendAckStart();      // confirma camino de notify
       iniciarEntrenamiento();
     } else if (cmd == "STOP") {
       entrenamientoIniciado = false;
       entrenamientoFinalizado = true;
       Serial.println("⛔ STOP recibido");
+    } else if (cmd == "TEST") {
+      Serial.println("🧪 TEST -> enviando JSON final inmediato");
+      enviarJsonFinalYTerminar();
     }
   }
 };
 
-// ---------------- Setup/Loop ----------------
+// ---------------- Setup BLE ----------------
 void setupBLE() {
   NimBLEDevice::init("NeoRCP");
   NimBLEDevice::setPower(ESP_PWR_LVL_P7);
@@ -166,18 +164,17 @@ void setupBLE() {
   g_server = NimBLEDevice::createServer();
   g_server->setCallbacks(new ServerCB());
 
-  auto svc = g_server->createService(SVC_UUID);
+  NimBLEService* svc = g_server->createService(SVC_UUID);
 
-  // TX: Notify (resultados) + CCCD (0x2902) y callback de suscripción
+  // TX: Notify + CCCD
   g_txChar = svc->createCharacteristic(
       TX_UUID,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
-  g_txChar->addDescriptor(new NimBLE2902());  // ⭐️ permite que Android escriba el CCCD
-  g_txChar->setCallbacks(new TxCB());
+  g_txChar->addDescriptor(new NimBLE2902()); // permite que Android habilite notificaciones
 
   // RX: Write (comandos)
-  auto rx = svc->createCharacteristic(
+  NimBLECharacteristic* rx = svc->createCharacteristic(
       RX_UUID,
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
@@ -186,42 +183,56 @@ void setupBLE() {
   svc->start();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->setName("NeoRCP");
   adv->addServiceUUID(SVC_UUID);
+  adv->setName("NeoRCP");
   adv->enableScanResponse(true);
   adv->start();
 
   Serial.println("📡 Advertising iniciado: NeoRCP");
 }
 
+// ---------------- Arduino setup/loop ----------------
 void setup() {
   Serial.begin(115200);
-  pinMode(botonPin, INPUT_PULLUP); // ⚠ requiere pull-up externo en GPIO35
+  pinMode(botonPin, INPUT_PULLUP); // ⚠️ 35 no tiene pull-up interno: usar resistencia externa
   pinMode(sensorPin, INPUT);
+
   setupBLE();
-  Serial.println("Esperando START por BLE (o 'YA' por Serial).");
+  Serial.println("Listo. Enviar START/TEST por BLE (o 'YA' por Serial).");
 }
 
 void loop() {
   // Debug por Serial
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n'); cmd.trim(); cmd.toUpperCase();
-    if (cmd == "YA") iniciarEntrenamiento();
+    if (cmd == "YA") {
+      sendAckStart();
+      iniciarEntrenamiento();
+    } else if (cmd == "TEST") {
+      enviarJsonFinalYTerminar();
+    }
   }
 
   if (!entrenamientoIniciado || entrenamientoFinalizado) return;
 
-  // Timeout
+  // Timeout de entrenamiento
   if (millis() - tiempoInicio >= DURACION_MS) {
+    Serial.println("⏱️ Timeout alcanzado, enviando JSON final");
     enviarJsonFinalYTerminar();
     return;
+  }
+
+  // Ticks de diagnóstico (1/s)
+  if (millis() - ultimoTick >= 1000) {
+    ultimoTick = millis();
+    bleNotifyLine(String("{\"tick\":\"") + String((millis() - tiempoInicio) / 1000) + "\"}");
   }
 
   unsigned long t = millis();
   estadoBotonActual = digitalRead(botonPin);
   int estadoSensor  = digitalRead(sensorPin);
 
-  // Flanco de bajada
+  // Flanco de bajada (apretar)
   if (estadoBotonAnterior == HIGH && estadoBotonActual == LOW && (t - ultimoCambio) > debounceDelay) {
     ultimoCambio    = t;
     presionado      = true;
@@ -230,19 +241,23 @@ void loop() {
   }
 
   if (presionado) {
-    if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;
-    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true;
+    if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;   // fuerza aplicada
+    if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true; // liberada
 
-    // Flanco de subida
+    // Flanco de subida (soltar)
     if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (t - ultimoCambio) > debounceDelay) {
       ultimoCambio = t;
       presionado   = false;
       compresionesTotales++;
 
-      if (fuerzaDetectada && fuerzaLiberada) fuerzaCorrecta++;
+      if (fuerzaDetectada && fuerzaLiberada) {
+        fuerzaCorrecta++;
+      }
 
       unsigned long intervalo = t - tiempoAnterior;
-      if (intervalo >= intervaloMin && intervalo <= intervaloMax) ritmoCorrecto++;
+      if (intervalo >= intervaloMin && intervalo <= intervaloMax) {
+        ritmoCorrecto++;
+      }
       tiempoAnterior = t;
     }
   }
