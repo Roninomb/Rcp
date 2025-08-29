@@ -1,11 +1,10 @@
 // === NeoRCP ESP32 (NimBLE) ===
 // Recibe "START" por BLE y, al terminar 20s, envía JSON por Notify.
-// Requiere: NimBLE-Arduino
 #include <NimBLEDevice.h>
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 35;   // ⚠ sin pull-up interno
+const int botonPin  = 35;   // ⚠ sin pull-up interno (usa resistencia externa o cambia a 32/33/25/26)
 const int sensorPin = 34;
 
 // ---------------- Lógica de entrenamiento ----------------
@@ -43,6 +42,9 @@ NimBLEServer*         g_server  = nullptr;
 NimBLECharacteristic* g_txChar  = nullptr;
 bool g_deviceConnected = false;
 
+// Si llega START antes de que Android termine de suscribirse, guardamos un ACK pendiente
+bool g_ackStartPendiente = false;
+
 // ---------- Utils de notificación ----------
 void bleNotifyLine(const String& s) {
   if (!g_deviceConnected || g_txChar == nullptr) {
@@ -58,7 +60,10 @@ void bleNotifyLine(const String& s) {
   g_txChar->notify();
 }
 
-void sendAckStart() { bleNotifyLine("{\"ack\":\"start\"}"); }
+void sendAckStart() {
+  bleNotifyLine("{\"ack\":\"start\"}");
+  Serial.println("📤 ACK START enviado");
+}
 
 // ---------------- Lógica ----------------
 void resetEntrenamiento() {
@@ -115,6 +120,18 @@ class ServerCB : public NimBLEServerCallbacks {
   }
 };
 
+// Para loguear suscripciones al TX (CCCD 0x2902)
+class TxCB : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info, uint16_t subValue) override {
+    Serial.printf("📡 TX subscribed from %s, value=0x%04x, subs=%d\n",
+                  info.getAddress().toString().c_str(), subValue, c->getSubscribedCount());
+    if (g_ackStartPendiente) {
+      sendAckStart();
+      g_ackStartPendiente = false;
+    }
+  }
+};
+
 class RxCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& info) override {
     std::string v = c->getValue();
@@ -124,7 +141,13 @@ class RxCB : public NimBLECharacteristicCallbacks {
     Serial.print("📥 CMD: "); Serial.println(cmd);
 
     if (cmd == "START") {
-      sendAckStart();       // ✅ confirma suscripción y camino de NOTIFY
+      // ACK si ya hay suscripción; si no, quedará pendiente y se manda en onSubscribe
+      if (g_txChar && g_txChar->getSubscribedCount() > 0) {
+        sendAckStart();
+      } else {
+        Serial.println("⌛ ACK START pendiente (aún sin suscriptores)");
+        g_ackStartPendiente = true;
+      }
       iniciarEntrenamiento();
     } else if (cmd == "STOP") {
       entrenamientoIniciado = false;
@@ -145,11 +168,13 @@ void setupBLE() {
 
   auto svc = g_server->createService(SVC_UUID);
 
-  // TX: Notify (resultados)
+  // TX: Notify (resultados) + CCCD (0x2902) y callback de suscripción
   g_txChar = svc->createCharacteristic(
       TX_UUID,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
+  g_txChar->addDescriptor(new NimBLE2902());  // ⭐️ permite que Android escriba el CCCD
+  g_txChar->setCallbacks(new TxCB());
 
   // RX: Write (comandos)
   auto rx = svc->createCharacteristic(
