@@ -1,13 +1,11 @@
 // === NeoRCP ESP32 (NimBLE) ===
 // Recibe "START" por BLE (Write) y, al terminar 20s, envía un JSON por Notify.
-// UUIDs alineados con tu app Flutter.
-//
 // Requiere: Librería "NimBLE-Arduino"
 
 #include <NimBLEDevice.h>
 
-// ---------------- Pines (como tu sketch) ----------------
-const int botonPin  = 35;    // OJO: sin pull-up interno
+// ---------------- Pines ----------------
+const int botonPin  = 35;    // ⚠️ sin pull-up interno
 const int sensorPin = 34;    // HIGH/LOW de fuerza
 
 // ---------------- Lógica de entrenamiento ----------------
@@ -36,13 +34,13 @@ bool presionado      = false;
 bool fuerzaDetectada = false;
 bool fuerzaLiberada  = false;
 
-// ---------------- BLE (UUIDs de tu app) ----------------
+// ---------------- BLE (UUIDs) ----------------
 #define SVC_UUID   "f0000001-0451-4000-b000-000000000000"
 #define RX_UUID    "f0000002-0451-4000-b000-000000000000" // Write (App -> ESP32)
 #define TX_UUID    "f0000003-0451-4000-b000-000000000000" // Notify (ESP32 -> App)
 
-NimBLEServer*        g_server  = nullptr;
-NimBLECharacteristic* g_txChar = nullptr;
+NimBLEServer*         g_server  = nullptr;
+NimBLECharacteristic* g_txChar  = nullptr;
 bool g_deviceConnected = false;
 
 // ---------------- Utilidades ----------------
@@ -72,23 +70,22 @@ void enviarJsonFinalYTerminar() {
   float compresionesTotales2 = compresionesTotales - PrimeraCompresion;
   float pctRitmo   = (compresionesTotales2 > 0) ? (ritmoCorrecto  * 100.0 / compresionesTotales2) : 0.0;
   float pctFuerza  = (compresionesTotales  > 0) ? (fuerzaCorrecta * 100.0 / compresionesTotales)  : 0.0;
-  float pctGeneral = (pctRitmo + pctFuerza) / 2.0;
 
   int fuerzaPct = (int)roundf(pctFuerza);
   bool ritmoOK  = (pctRitmo >= 60.0);  // umbral simple
 
-  // JSON que tu app espera (strings y boolean como "true"/"false")
+  // JSON que la app espera
   String json = String("{")
-                + "\"fuerza\":\"" + String(fuerzaPct) + "\","
-                + "\"pulsos\":\"" + String(compresionesTotales) + "\","
-                + "\"ritmo\":\""  + String(ritmoOK ? "true" : "false") + "\""
+                + "\"fuerza\":\"" + String(fuerzaPct) + "\"," 
+                + "\"pulsos\":\"" + String(compresionesTotales) + "\"," 
+                + "\"ritmo\":\""  + String(ritmoOK ? "true" : "false") + "\"" 
                 + "}";
 
   Serial.println("📤 JSON final:");
   Serial.println(json);
 
   if (g_deviceConnected && g_txChar) {
-    String payload = json + "\n";             // IMPORTANTE: terminador de línea
+    String payload = json + "\n"; // terminador de línea
     g_txChar->setValue((uint8_t*)payload.c_str(), payload.length());
     g_txChar->notify();
   } else {
@@ -98,20 +95,20 @@ void enviarJsonFinalYTerminar() {
 
 // ---------------- Callbacks BLE ----------------
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*) override {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     g_deviceConnected = true;
-    Serial.println("✅ Central conectada");
+    Serial.printf("✅ Central conectada: %s\n", connInfo.getAddress().toString().c_str());
   }
-  void onDisconnect(NimBLEServer* s) override {
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     g_deviceConnected = false;
-    Serial.println("🚪 Central desconectada");
+    Serial.println("🚪 Central desconectada. Reiniciando advertising...");
     NimBLEDevice::startAdvertising();
   }
 };
 
 class RxCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override {
-    std::string v = c->getValue();
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+    std::string v = pCharacteristic->getValue();
     if (v.empty()) return;
     String cmd;
     for (char ch : v) cmd += ch;
@@ -155,18 +152,20 @@ void setupBLE() {
   svc->start();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setName("NeoRCP");
   adv->addServiceUUID(SVC_UUID);
-  adv->setScanResponse(true);
+  adv->enableScanResponse(true);
   adv->start();
-  Serial.println("📡 Advertising: NeoRCP");
+
+  Serial.println("📡 Advertising iniciado: NeoRCP");
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(botonPin, INPUT_PULLUP); // ⚠️ pull-up externo si usás GPIO35
+  pinMode(botonPin, INPUT_PULLUP); // ⚠️ GPIO35 necesita pull-up externo
   pinMode(sensorPin, INPUT);
   setupBLE();
-  Serial.println("Esperando START por BLE (o escribir 'YA' por Serial para test).");
+  Serial.println("Esperando comando START por BLE (o escribir 'YA' por Serial para test).");
 }
 
 void loop() {
