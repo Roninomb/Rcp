@@ -1,18 +1,18 @@
 // === NeoRCP ESP32 (NimBLE) ===
 // Recibe "START" por BLE y, al terminar 20s, envía JSON por Notify.
+// Ahora envía: fuerza (porcentaje), pulsos (porcentaje de ritmo) y total (compresiones totales).
 #include <NimBLEDevice.h>
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 35;   // ⚠ sin pull-up interno (usa resistencia externa o cambia a 32/33/25/26)
+const int botonPin  = 33;   // ⚠ sin pull-up interno (usa resistencia externa o cambia a 32/33/25/26)
 const int sensorPin = 34;
 
 // ---------------- Lógica de entrenamiento ----------------
 int estadoBotonActual   = HIGH;
 int estadoBotonAnterior = HIGH;
 
-float PrimeraCompresion = 1;
-unsigned long tiempoAnterior = 0;
+unsigned long tiempoAnterior = 0;  // para calcular intervalo entre compresiones
 unsigned long ultimoCambio   = 0;
 
 const unsigned long intervaloMin  = 450;   // ms
@@ -21,7 +21,10 @@ const unsigned long debounceDelay = 50;    // ms
 const unsigned long DURACION_MS   = 20000; // 20 s
 
 int compresionesTotales = 0;
+// "ritmoCorrecto" cuenta cuántos intervalos entre compresiones cayeron en rango.
+// Nota: con N compresiones hay (N-1) intervalos posibles.
 int ritmoCorrecto       = 0;
+// "fuerzaCorrecta" cuenta cuántas compresiones cumplieron ciclo fuerza LOW→HIGH.
 int fuerzaCorrecta      = 0;
 
 unsigned long tiempoInicio   = 0;
@@ -48,10 +51,9 @@ bool g_ackStartPendiente = false;
 // ---------- Utils de notificación ----------
 void bleNotifyLine(const String& s) {
   if (!g_deviceConnected || g_txChar == nullptr) {
-    Serial.println("⚠️ No hay central conectada o TX nulo; no se notifica.");
+    Serial.println("No hay central conectada o TX nulo; no se notifica.");
     return;
   }
-
   String line = s.endsWith("\n") ? s : (s + "\n");   // SIEMPRE '\n'
   g_txChar->setValue((uint8_t*)line.c_str(), line.length());
   g_txChar->notify();
@@ -59,7 +61,7 @@ void bleNotifyLine(const String& s) {
 
 void sendAckStart() {
   bleNotifyLine("{\"ack\":\"start\"}");
-  Serial.println("📤 ACK START enviado");
+  Serial.println("ACK START enviado");
 }
 
 // ---------------- Lógica ----------------
@@ -79,27 +81,33 @@ void iniciarEntrenamiento() {
   entrenamientoFinalizado = false;
   resetEntrenamiento();
   tiempoInicio = millis();
-  Serial.println("🔁 Entrenamiento iniciado: 20s");
+  Serial.println("Entrenamiento iniciado: 20s");
 }
 
 void enviarJsonFinalYTerminar() {
   entrenamientoFinalizado = true;
   entrenamientoIniciado   = false;
 
-  float comp2     = compresionesTotales - PrimeraCompresion;
-  float pctRitmo  = (comp2 > 0) ? (ritmoCorrecto  * 100.0f / comp2) : 0.0f;
-  float pctFuerza = (compresionesTotales > 0) ? (fuerzaCorrecta * 100.0f / compresionesTotales) : 0.0f;
+  // Porcentajes:
+  // - Fuerza efectiva: compresiones con ciclo LOW→HIGH sobre el total de compresiones
+  int fuerzaPct = (compresionesTotales > 0)
+                    ? (int)roundf(fuerzaCorrecta * 100.0f / compresionesTotales)
+                    : 0;
 
-  int  fuerzaPct = (int)roundf(pctFuerza);
-  bool ritmoOK   = (pctRitmo >= 60.0f);
+  // - Pulsos efectivos (ritmo): intervalos correctos sobre (compresionesTotales - 1)
+  //   (si hay 0 o 1 compresión, no hay intervalos)
+  int ritmoDen = (compresionesTotales > 1) ? (compresionesTotales - 1) : 0;
+  int ritmoPct = (ritmoDen > 0)
+                    ? (int)roundf(ritmoCorrecto * 100.0f / ritmoDen)
+                    : 0;
 
   String json = String("{")
-                + "\"fuerza\":\""  + String(fuerzaPct)           + "\"," 
-                + "\"pulsos\":\""  + String(compresionesTotales) + "\"," 
-                + "\"ritmo\":\""   + String(ritmoOK ? "true" : "false") + "\"" 
+                + "\"fuerza\":\"" + String(fuerzaPct)           + "\","  // porcentaje 0-100
+                + "\"pulsos\":\"" + String(ritmoPct)            + "\","  // porcentaje 0-100
+                + "\"total\":\""  + String(compresionesTotales) + "\""   // compresiones totales
                 + "}";
 
-  Serial.println("📤 JSON final:");
+  Serial.println("JSON final:");
   Serial.println(json);
   bleNotifyLine(json);
 }
@@ -108,11 +116,11 @@ void enviarJsonFinalYTerminar() {
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
     g_deviceConnected = true;
-    Serial.printf("✅ Central conectada: %s\n", info.getAddress().toString().c_str());
+    Serial.printf("Central conectada: %s\n", info.getAddress().toString().c_str());
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     g_deviceConnected = false;
-    Serial.println("🚪 Central desconectada. Re-Advertising…");
+    Serial.println("Central desconectada. Re-Advertising…");
     NimBLEDevice::startAdvertising();
   }
 };
@@ -120,7 +128,7 @@ class ServerCB : public NimBLEServerCallbacks {
 // Para loguear suscripciones al TX
 class TxCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info, uint16_t subValue) override {
-    Serial.printf("📡 TX subscribed from %s, value=0x%04x\n",
+    Serial.printf("TX subscribed from %s, value=0x%04x\n",
                   info.getAddress().toString().c_str(), subValue);
     if (g_ackStartPendiente) {
       sendAckStart();
@@ -135,7 +143,7 @@ class RxCB : public NimBLECharacteristicCallbacks {
     if (v.empty()) return;
     String cmd; for (char ch: v) cmd += ch;
     cmd.trim(); cmd.toUpperCase();
-    Serial.print("📥 CMD: "); Serial.println(cmd);
+    Serial.print("CMD: "); Serial.println(cmd);
 
     if (cmd == "START") {
       // ACK si ya hay suscripción; si no, queda pendiente
@@ -146,7 +154,7 @@ class RxCB : public NimBLECharacteristicCallbacks {
     } else if (cmd == "STOP") {
       entrenamientoIniciado = false;
       entrenamientoFinalizado = true;
-      Serial.println("⛔ STOP recibido");
+      Serial.println("STOP recibido");
     }
   }
 };
@@ -184,12 +192,12 @@ void setupBLE() {
   adv->enableScanResponse(true);
   adv->start();
 
-  Serial.println("📡 Advertising iniciado: NeoRCP");
+  Serial.println("Advertising iniciado: NeoRCP");
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(botonPin, INPUT_PULLUP); // ⚠ requiere pull-up externo en GPIO35
+  pinMode(botonPin, INPUT_PULLUP); // ⚠ GPIO35 no tiene pull-up interno; usar resistencia externa si se mantiene este pin.
   pinMode(sensorPin, INPUT);
   setupBLE();
   Serial.println("Esperando START por BLE (o 'YA' por Serial).");
@@ -235,7 +243,9 @@ void loop() {
       if (fuerzaDetectada && fuerzaLiberada) fuerzaCorrecta++;
 
       unsigned long intervalo = t - tiempoAnterior;
-      if (intervalo >= intervaloMin && intervalo <= intervaloMax) ritmoCorrecto++;
+      if (tiempoAnterior > 0) {
+        if (intervalo >= intervaloMin && intervalo <= intervaloMax) ritmoCorrecto++;
+      }
       tiempoAnterior = t;
     }
   }
