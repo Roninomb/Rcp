@@ -1,11 +1,14 @@
 // === NeoRCP ESP32 (NimBLE) ===
 // Recibe "START" por BLE y, al terminar 20s, envía JSON por Notify.
-// Ahora envía: fuerza (porcentaje), pulsos (porcentaje de ritmo) y total (compresiones totales).
+// Ahora también envía por cada compresión: LIVE,<forceOk>,<rhythmCat>
+//   forceOk: 0/1 (incorrecta/correcta)
+//   rhythmCat: 1=lento, 2=rápido, 3=correcto
+
 #include <NimBLEDevice.h>
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 33;   // ⚠ sin pull-up interno (usa resistencia externa o cambia a 32/33/25/26)
+const int botonPin  = 33;   // ⚠ sin pull-up interno (usa resistor externo o migrar a 32/33/25/26)
 const int sensorPin = 34;
 
 // ---------------- Lógica de entrenamiento ----------------
@@ -15,8 +18,8 @@ int estadoBotonAnterior = HIGH;
 unsigned long tiempoAnterior = 0;  // para calcular intervalo entre compresiones
 unsigned long ultimoCambio   = 0;
 
-const unsigned long intervaloMin  = 450;   // ms
-const unsigned long intervaloMax  = 650;   // ms
+const unsigned long intervaloMin  = 450;   // ms (≈133 cpm)
+const unsigned long intervaloMax  = 650;   // ms (≈92 cpm)
 const unsigned long debounceDelay = 50;    // ms
 const unsigned long DURACION_MS   = 20000; // 20 s
 
@@ -197,7 +200,7 @@ void setupBLE() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(botonPin, INPUT_PULLUP); // ⚠ GPIO35 no tiene pull-up interno; usar resistencia externa si se mantiene este pin.
+  pinMode(botonPin, INPUT_PULLUP); // ⚠ GPIO33: pull-up ok; si cambiás a 34/35/36/39, no tienen pull interno
   pinMode(sensorPin, INPUT);
   setupBLE();
   Serial.println("Esperando START por BLE (o 'YA' por Serial).");
@@ -234,7 +237,7 @@ void loop() {
     if (!fuerzaDetectada && estadoSensor == LOW)  fuerzaDetectada = true;
     if (fuerzaDetectada && !fuerzaLiberada && estadoSensor == HIGH) fuerzaLiberada = true;
 
-    // Flanco de subida
+    // Flanco de subida = cierre de compresión
     if (estadoBotonAnterior == LOW && estadoBotonActual == HIGH && (t - ultimoCambio) > debounceDelay) {
       ultimoCambio = t;
       presionado   = false;
@@ -246,6 +249,24 @@ void loop() {
       if (tiempoAnterior > 0) {
         if (intervalo >= intervaloMin && intervalo <= intervaloMax) ritmoCorrecto++;
       }
+
+      // === NUEVO: enviar LIVE por compresión ===
+      uint8_t forceOk = (fuerzaDetectada && fuerzaLiberada) ? 1 : 0;
+
+      // 1=lento, 2=rápido, 3=correcto (para la primera compresión no hay ritmo)
+      uint8_t rhythmCat = 0;
+      if (tiempoAnterior > 0) {
+        if (intervalo < intervaloMin)       rhythmCat = 2; // muy rápido
+        else if (intervalo > intervaloMax)  rhythmCat = 1; // muy lento
+        else                                rhythmCat = 3; // correcto
+      }
+
+      if (rhythmCat != 0) {
+        String live = String("LIVE,") + String(forceOk) + "," + String(rhythmCat);
+        bleNotifyLine(live); // envía con '\n'
+        // Serial.println(live);
+      }
+
       tiempoAnterior = t;
     }
   }
