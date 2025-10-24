@@ -8,7 +8,7 @@
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 33;   // ⚠ sin pull-up interno (usa resistor externo o migrar a 32/33/25/26)
+const int botonPin  = 32 ;   // ⚠ sin pull-up interno (usa resistor externo o migrar a 32/33/25/26)
 const int sensorPin = 34;
 
 // ---------------- Lógica de entrenamiento ----------------
