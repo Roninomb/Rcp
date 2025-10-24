@@ -8,8 +8,8 @@
 #include <math.h>
 
 // ---------------- Pines ----------------
-const int botonPin  = 32;   
-const int sensorPin = 34;
+const int botonPin  = 1;   
+const int sensorPin = 4;
 
 // ---------------- Lógica de entrenamiento ----------------
 int estadoBotonActual   = HIGH;
@@ -165,7 +165,7 @@ class RxCB : public NimBLECharacteristicCallbacks {
 // ---------------- Setup/Loop ----------------
 void setupBLE() {
   NimBLEDevice::init("NeoRCP");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(185);
 
   g_server = NimBLEDevice::createServer();
